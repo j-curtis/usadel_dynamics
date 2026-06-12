@@ -1,8 +1,9 @@
-# Usadel Dynamics API
+# Usadel Dynamics
 
-This document describes the object-oriented interface in `usadel_dynamics.py`.
-It is intended to become the public API documentation for the repository as the
-solver stabilizes.
+This repository contains numerical tools for homogeneous kinetic Usadel
+dynamics in a BCS superconductor. The main solver lives in
+`usadel_dynamics.py`, with a standalone clean-limit comparison helper in
+`clean_BCS.py`.
 
 ## Module Overview
 
@@ -21,6 +22,9 @@ small set of cooperating objects:
 - `StateBundle`: cached state representation containing `X`, `Delta`, `gR`,
   and `gK`.
 
+`clean_BCS.py` is independent of the Usadel module and provides simple
+clean-limit BCS current helper functions.
+
 The encoded state is always the full per-frequency vector
 
 ```text
@@ -29,6 +33,58 @@ X_w = [Re chi_w, Im chi_w, f0_w, f3_w].
 
 The spectral degree of freedom `chi_w` is algebraically constrained, but it is
 kept in the state so equilibrium and dynamics use the same representation.
+
+## Data Types and Shapes
+
+The module uses NumPy arrays throughout. Nambu matrices are represented as
+Pauli-vector components in the order
+
+```text
+[tau0, tau1, tau2, tau3].
+```
+
+Common shapes:
+
+| Object | Type | Shape | Meaning |
+| --- | --- | --- | --- |
+| `ws` | real array | `(nw,)` | Frequency grid. |
+| `time_points` | real array | `(nt,)` | Simulation times. |
+| `dts` | real array | `(nt - 1,)` | Local time steps. |
+| `chi` | complex array | `(nw,)` | Spectral angle. |
+| `f` | complex array | `(nw,)` | Occupation encoding, with `real(f)=f0` and `imag(f)=f3`. |
+| `X` | real array | `(4 * nw,)` | Flattened state vector. |
+| `X.reshape((nw, 4))` | real array | `(nw, 4)` | Per-frequency `[Re chi, Im chi, f0, f3]`. |
+| `gR`, `gK` | complex array | `(nw, 4)` | Retarded and Keldysh Green functions as Pauli vectors. |
+| `gR_t_w`, `gK_t_w` | complex array | `(nt_returned, nw, 4)` | Retarded and Keldysh Green-function traces. |
+| `hR`, `hK` | complex array | `(nw, 4)` | Retarded and Keldysh Hamiltonian/self-energy combinations. |
+| `Delta` | float | scalar | Gap value associated with a state. |
+
+`StateBundle` stores one time slice:
+
+| Field | Type | Shape |
+| --- | --- | --- |
+| `X` | real array | `(4 * nw,)` |
+| `Delta` | float | scalar |
+| `gR` | complex array | `(nw, 4)` |
+| `gK` | complex array | `(nw, 4)` |
+
+`DynamicsResult` stores traces:
+
+| Field | Type | Shape |
+| --- | --- | --- |
+| `times` | real array | `(nt_returned,)` |
+| `X` | real array | `(nt_returned, 4 * nw)` |
+| `Delta` | real array | `(nt_returned,)` |
+| `converged` | bool array | `(nt_returned,)` |
+| `scipy_converged` | bool array | `(nt_returned,)` |
+| `residual_converged` | bool array | `(nt_returned,)` |
+| `iterations` | int array | `(nt_returned,)` |
+| `residual` | real array | `(nt_returned,)` |
+| `step_time` | real array | `(nt_returned,)` |
+| `current` | real array or `None` | `(nt_returned,)` |
+
+If dynamics stops early after a failed step, `nt_returned` is shorter than the
+input time grid.
 
 ## Basic Setup
 
@@ -145,6 +201,90 @@ terms = algebra.sigma_terms("retarded", bundle.Delta, t=7.0, gR=bundle.gR)
 print([np.max(np.abs(sigma)) for sigma in terms])
 ```
 
+## Algebra Objects
+
+`PauliAlgebra` contains low-level vectorized operations on Pauli-vector Nambu
+matrices. Most users should not need to call it directly, but it defines the
+matrix products, commutators, anticommutators, advanced components, and selected
+component products used by the solver.
+
+`UsadelAlgebra` is the main algebra interface. It owns the conversion between
+the encoded state `X`, Green functions, Hamiltonians, and residuals:
+
+```python
+chi, f = algebra.components(X)
+gR, gK = algebra.g_from_state(X)
+gR_t_w, gK_t_w = algebra.g_from_state(result.X)
+Delta = algebra.gap_from_state(X)
+hR, hK = algebra.h_from_state(X, t)
+bundle = algebra.bundle_state(X)
+```
+
+Common methods:
+
+| Method | Purpose |
+| --- | --- |
+| `make_state(chi, f)` | Pack complex `chi` and occupation `f=f0+i f3` into flattened `X`. |
+| `components(X)` | Unpack a flattened state or state trace into complex `chi` and `f`. |
+| `occupation_components(X)` | Unpack a flattened state or state trace into real `f0` and `f3`. |
+| `g_from_state(X)` | Construct `gR(X)` and `gK(X)` from a state or state trace. |
+| `gR_from_state(X)` | Construct only `gR(X)` from a state or state trace. |
+| `gK_from_state(X)` | Construct only `gK(X)` from a state or state trace. |
+| `current_integrand_from_state(X, A)` | Compute the lowest-order Moyal current integrand for a state or trace with explicit `A`. |
+| `current_from_state(X, A)` | Compute the lowest-order Moyal current `J/sigma_n` for a state or trace with explicit `A`. |
+| `gap_from_state(X)` | Compute `Delta[X]` from `gK(X)`. |
+| `gap_from_gK(gK)` | Compute the gap directly from a Keldysh Green function. |
+| `h_from_state(X, t, Delta=None)` | Construct `hR`, `hK` using `Delta[X]` unless supplied. |
+| `hamiltonian(Delta, t, gR, gK)` | Construct `h0 - sigma_total` for supplied Green functions. |
+| `sigma(part, Delta, t, gR, gK)` | Sum all self-energy contributions for `"retarded"` or `"keldysh"`. |
+| `sigma_terms(part, Delta, t, gR, gK)` | Return the individual self-energy terms before summing. |
+| `bundle_state(X, Delta=None)` | Attach cached `gR`, `gK`, and `Delta` to an encoded state. |
+| `backward_euler_residual_vector(...)` | Packed residual used by the nonlinear dynamics solver. |
+
+The cleanest way to extract occupations from a dynamics result is through the
+algebra helper:
+
+```python
+chi_t_w, f_t_w = algebra.components(result.X)
+f0_t_w, f3_t_w = algebra.occupation_components(result.X)
+f_t_w = f0_t_w + 1j * f3_t_w
+gR_t_w, gK_t_w = algebra.g_from_state(result.X)
+```
+
+Here `f0_t_w[i, j]` and `f3_t_w[i, j]` are the occupation components at
+`time=result.times[i]` and `frequency=grid.ws[j]`.
+
+The lowest-order Moyal current is computed automatically in equilibrium and
+dynamics results when `solverParams.compute_current=True`, the default.
+Equilibrium uses the static/equilibrium vector potential from the model at
+`t=0`; dynamics evaluates the vector potential on `result.times`.
+
+```python
+eq = equilibrium.equilibrium(Delta0=1.0)
+J_eq = eq.current
+
+result = dynamics.run()
+J_t = result.current
+```
+
+Currents can also be recomputed from result objects:
+
+```python
+J_eq = equilibrium.current(eq)
+J_t = dynamics.current(result)
+```
+
+The lower-level algebra method requires the vector potential to be supplied
+explicitly:
+
+```python
+J_eq = algebra.current_from_state(eq.X, A=0.2)
+J_t = algebra.current_from_state(result.X, A=A_t(result.times))
+```
+
+The returned current is normalized as `J/sigma_n`; the implementation currently
+sets `sigma_n = 1`.
+
 ## Equilibrium
 
 Equilibrium solves for the retarded state and self-consistent gap using the same
@@ -163,10 +303,24 @@ The returned `GapResult` contains:
 - `X`: encoded state.
 - `gR`: retarded Green function.
 - `gK`: Keldysh Green function fixed by equilibrium occupation.
+- `current`: lowest-order Moyal current `J/sigma_n`, or `None` if disabled.
 - `converged`, `iterations`, and `error`.
 
 For a static vector potential, include `VectorPotentialDrive(A_static)` in the
 model self-energy list before building the equilibrium model.
+
+Equilibrium backend selection is controlled by `solverParams.equilibrium_method`:
+
+- `"fixed_point"`: nested fixed-point iteration over the retarded state and gap.
+  This is the current default.
+- `"chi_root"`: root finding over the spectral angle `chi`, with `Delta[chi]`
+  imposed inside the residual. This backend first runs the fixed-point solver
+  and uses that state as the root-solver initial guess.
+
+The `"chi_root"` backend is experimental. Its residual has multiple mathematical
+roots, including the normal branch with `Delta=0`, so it can converge to the
+normal branch near the transition without continuation in external parameters or
+an explicit branch-selection rule.
 
 ## Dynamics
 
@@ -201,6 +355,7 @@ The returned `DynamicsResult` contains:
 - `iterations`
 - `residual`
 - `step_time`
+- `current`
 
 ## Progress Feedback
 
@@ -296,6 +451,9 @@ Derived fields:
 | `retarded_tol` | `1.0e-11` |
 | `retarded_mix` | `0.7` |
 | `retarded_step` | `0.05` |
+| `equilibrium_method` | `"fixed_point"` |
+| `equilibrium_root_maxiter` | `2000` |
+| `equilibrium_root_tol` | `1.0e-10` |
 | `gap_step` | `0.5` |
 | `gap_tol` | `1.0e-9` |
 | `gap_maxiter` | `200` |
@@ -313,6 +471,7 @@ Derived fields:
 | `dynamics_safety` | `0.9` |
 | `dynamics_progress` | `False` |
 | `dynamics_progress_every` | `1` |
+| `compute_current` | `True` |
 
 ### Self-Energy Objects
 
@@ -349,6 +508,7 @@ Derived fields:
 | `converged` | Boolean convergence flag. |
 | `iterations` | Number of gap iterations. |
 | `error` | Final reported gap/retarded error. |
+| `current` | Lowest-order Moyal current `J/sigma_n`, or `None` if disabled. |
 
 ### `DynamicsResult`
 
@@ -363,3 +523,4 @@ Derived fields:
 | `iterations` | Per-step function evaluation count from the nonlinear solver. |
 | `residual` | Per-step final residual norm. |
 | `step_time` | Per-step wall-clock time in seconds. |
+| `current` | Current trace `J/sigma_n`, or `None` if disabled. |

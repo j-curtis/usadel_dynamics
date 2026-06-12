@@ -135,6 +135,7 @@ class GapResult:
     converged: bool
     iterations: int
     error: float
+    current: Optional[float] = None
 
 
 @dataclass
@@ -148,6 +149,7 @@ class DynamicsResult:
     iterations: Array
     residual: Array
     step_time: Array
+    current: Optional[Array] = None
 
 
 @dataclass
@@ -243,6 +245,9 @@ class solverParams:
     retarded_tol: float = 1.0e-11
     retarded_mix: float = 0.7
     retarded_step: float = 0.05
+    equilibrium_method: str = "fixed_point"
+    equilibrium_root_maxiter: int = 2000
+    equilibrium_root_tol: float = 1.0e-10
     gap_step: float = 0.5
     gap_tol: float = 1.0e-9
     gap_maxiter: int = 200
@@ -260,6 +265,7 @@ class solverParams:
     dynamics_safety: float = 0.9
     dynamics_progress: bool = False
     dynamics_progress_every: int = 1
+    compute_current: bool = True
 
 
 @dataclass
@@ -507,12 +513,28 @@ class UsadelAlgebra:
             )
         return terms
 
+    def vector_potential_value(self, t: float | Array = 0.0) -> float | Array:
+        """Return the summed vector potential from VectorPotentialDrive terms."""
+        drives = [
+            sigma for sigma in self.params.self_energies
+            if isinstance(sigma, VectorPotentialDrive)
+        ]
+        if not drives:
+            return 0.0
+        t_arr = np.asarray(t, dtype=float)
+        if t_arr.ndim == 0:
+            return float(sum(drive.value(float(t_arr)) for drive in drives))
+        values = np.zeros_like(t_arr, dtype=float)
+        for index, t_value in np.ndenumerate(t_arr):
+            values[index] = sum(drive.value(float(t_value)) for drive in drives)
+        return values
+
     @staticmethod
     def _chi_to_gr(chi: Array) -> Array:
         """Construct ``gR = sin(chi) tau_2 + cos(chi) tau_3``."""
-        gr = np.zeros((len(chi), 4), dtype=complex)
-        gr[:, 2] = np.sin(chi)
-        gr[:, 3] = np.cos(chi)
+        gr = np.zeros(np.shape(chi) + (4,), dtype=complex)
+        gr[..., 2] = np.sin(chi)
+        gr[..., 3] = np.cos(chi)
         return gr
 
     @staticmethod
@@ -526,15 +548,15 @@ class UsadelAlgebra:
         This closed form is equivalent to the generic Pauli products, but avoids
         building F/gA and two full matrix multiplications.
         """
-        s = gR[:, 2]
-        c = gR[:, 3]
+        s = gR[..., 2]
+        c = gR[..., 3]
         f0 = np.real(f)
         f3 = np.imag(f)
         out = np.zeros_like(gR, dtype=complex)
-        out[:, 0] = f3 * (c + np.conjugate(c))
-        out[:, 1] = 1.0j * f3 * (s + np.conjugate(s))
-        out[:, 2] = f0 * (s - np.conjugate(s))
-        out[:, 3] = f0 * (c + np.conjugate(c))
+        out[..., 0] = f3 * (c + np.conjugate(c))
+        out[..., 1] = 1.0j * f3 * (s + np.conjugate(s))
+        out[..., 2] = f0 * (s - np.conjugate(s))
+        out[..., 3] = f0 * (c + np.conjugate(c))
         return out
 
     def hamiltonian(
@@ -570,16 +592,96 @@ class UsadelAlgebra:
         return self.pack_components(chi, f).reshape(-1)
 
     def components(self, X: Array) -> tuple[Array, Array]:
-        if X.size != 4 * self.nw:
-            raise ValueError(f"Expected full chi/f state with size {4 * self.nw}.")
-        return self.unpack_components(X.reshape((self.nw, 4)))
+        X = np.asarray(X)
+        if X.ndim == 1:
+            if X.size != 4 * self.nw:
+                raise ValueError(f"Expected full chi/f state with size {4 * self.nw}.")
+            return self.unpack_components(X.reshape((self.nw, 4)))
+        if X.ndim == 2:
+            if X.shape[1] != 4 * self.nw:
+                raise ValueError(f"Expected state trace with second dimension {4 * self.nw}.")
+            y = X.reshape((X.shape[0], self.nw, 4))
+            chi = y[:, :, 0] + 1.0j * y[:, :, 1]
+            f = y[:, :, 2] + 1.0j * y[:, :, 3]
+            return chi, f
+        raise ValueError("Expected a single state X or a two-dimensional state trace.")
+
+    def occupation_components(self, X: Array) -> tuple[Array, Array]:
+        """Return f0 and f3 from a single state or state trace."""
+        _, f = self.components(X)
+        return np.real(f), np.imag(f)
 
     def g_from_state(self, X: Array) -> tuple[Array, Array]:
-        """Return ``gR, gK`` from the full encoded state X."""
+        """Return ``gR, gK`` from a single encoded state or state trace."""
         chi, f = self.components(X)
         gR = self._chi_to_gr(chi)
         gK = self._build_gk(gR, f)
         return gR, gK
+
+    def gR_from_state(self, X: Array) -> Array:
+        """Return ``gR`` from a single encoded state or state trace."""
+        chi, _ = self.components(X)
+        return self._chi_to_gr(chi)
+
+    def gK_from_state(self, X: Array) -> Array:
+        """Return ``gK`` from a single encoded state or state trace."""
+        return self.g_from_state(X)[1]
+
+    ###################
+    # Current Observable
+    ###################
+
+    def current_integrand_from_state(
+        self,
+        X: Array,
+        A: float | Array,
+    ) -> Array:
+        """Return the lowest-order Moyal current integrand for X.
+
+        This computes J/sigma_n, i.e. sigma_n is set to one. Future extensions
+        should add higher-order Moyal corrections, especially dA/dt terms.
+        """
+        gR, gK = self.g_from_state(X)
+        return self.current_integrand_from_g(gR, gK, A)
+
+    def current_integrand_from_g(
+        self,
+        gR: Array,
+        gK: Array,
+        A: float | Array,
+    ) -> Array:
+        """Return frequency-resolved lowest-order current integrand.
+
+        Starting from
+            -i/8 tr tau3 (gR [tau3,gK] + gK [tau3,gA]) A,
+        and using gR = sin(chi) tau2 + cos(chi) tau3, the tau3 trace reduces to
+            -4 gK_2 (gR_2 + gR_2^*).
+        The implemented integrand is therefore
+            (i/2) A gK_2 (gR_2 + gR_2^*).
+        """
+        gR2 = gR[..., 2]
+        gK2 = gK[..., 2]
+        kernel = 0.5j * gK2 * (gR2 + np.conjugate(gR2))
+        if np.ndim(A) == 0:
+            integrand = float(A) * kernel
+        else:
+            A_arr = np.asarray(A, dtype=float)
+            if gR.ndim == 2:
+                raise ValueError("Array-valued A requires a state trace, not a single state.")
+            if A_arr.shape[0] != gR.shape[0]:
+                raise ValueError("Array-valued A must match the number of state time points.")
+            integrand = A_arr[:, None] * kernel
+        return np.real_if_close(integrand)
+
+    def current_from_state(
+        self,
+        X: Array,
+        A: float | Array,
+    ) -> float | Array:
+        """Return the lowest-order Moyal current J/sigma_n for a state or trace."""
+        integrand = self.current_integrand_from_state(X, A)
+        current = np.trapz(integrand, self.ws, axis=-1)
+        return float(np.real(current)) if np.ndim(current) == 0 else np.real(current)
 
     def gap_from_state(self, X: Array) -> float:
         """Return the BCS gap implied directly by ``gK(X)``."""
@@ -946,15 +1048,18 @@ class EquilibriumModel:
         """Solve [gR, hR] = 0 and return a bundled constrained state."""
         opts = solver_params or self.solver_params
         gR = self._normalize_retarded(self.algebra.hR_from_gR(None, Delta))
+        chi = self.algebra._gr_to_chi(gR)
         err = np.inf
         for it in range(1, opts.retarded_maxiter + 1):
             gR_new = self._normalize_retarded(
                 self.algebra.hR_from_gR(gR, Delta)
             )
-            err = float(np.max(np.abs(gR_new - gR)))
-            gR = opts.retarded_mix * gR_new + (1.0 - opts.retarded_mix) * gR
+            chi_new = self.algebra._gr_to_chi(gR_new)
+            err = float(np.max(np.abs(chi_new - chi)))
             if err < opts.retarded_tol:
                 return self.algebra.state_from_retarded(X, gR_new), True, it, err
+            chi = opts.retarded_mix * chi_new + (1.0 - opts.retarded_mix) * chi
+            gR = self.algebra._chi_to_gr(chi)
         return self.algebra.state_from_retarded(X, gR), False, opts.retarded_maxiter, err
 
     def gap_from_state_at_delta(
@@ -970,7 +1075,85 @@ class EquilibriumModel:
         )
         return self.algebra.gap_from_gK(bundle.gK), bundle, converged, iterations, error
 
-    def solve_gap(
+    def _gap_result(
+        self,
+        bundle: StateBundle,
+        converged: bool,
+        iterations: int,
+        error: float,
+        opts: solverParams,
+    ) -> GapResult:
+        result = GapResult(
+            bundle.Delta,
+            bundle.gR,
+            bundle.gK,
+            bundle.X,
+            converged,
+            iterations,
+            error,
+        )
+        if opts.compute_current:
+            result.current = self.current(result)
+        return result
+
+    def equilibrium_residual_vector(self, y: Array) -> Array:
+        """Return retarded commutator residual with Delta hard-imposed."""
+        chi = y[: self.algebra.nw] + 1.0j * y[self.algebra.nw :]
+        f = self.algebra.fd(self.ws, self.algebra.params.T).astype(complex)
+        X = self.algebra.make_state(chi, f)
+        gR, gK = self.algebra.g_from_state(X)
+        Delta = self.algebra.gap_from_gK(gK)
+        hR, _ = self.algebra.hamiltonian(Delta, 0.0, gR, gK)
+        tau1_residual = 2.0j * (hR[:, 2] * gR[:, 3] - hR[:, 3] * gR[:, 2])
+        return np.concatenate((np.real(tau1_residual), np.imag(tau1_residual)))
+
+    def initial_chi_guess(self, Delta0: float) -> Array:
+        """Return a normalized BCS-like spectral-angle initial guess."""
+        gR = self._normalize_retarded(self.algebra.hR_from_gR(None, Delta0))
+        return self.algebra._gr_to_chi(gR)
+
+    def solve_gap_chi_root(
+        self,
+        X: Array,
+        Delta0: float = 1.0,
+        solver_params: solverParams | None = None,
+    ) -> GapResult:
+        """Solve equilibrium by root finding over chi with Delta[chi] hard imposed."""
+        # Known issue:
+        # The chi-root residual has multiple mathematical roots, including the
+        # normal branch Delta=0. Without continuation in external parameters or
+        # an explicit branch/stability selection rule, scipy.root can converge to
+        # the normal branch even when the superconducting branch also exists.
+        # To reduce branch jumping, this backend first runs the fixed-point
+        # equilibrium solver and uses its chi as the root-solver initial guess.
+        # Treat this backend as experimental until proper branch tracking is
+        # added.
+        opts = solver_params or self.solver_params
+        try:
+            from scipy.optimize import root
+        except ImportError as exc:
+            raise ImportError("Equilibrium chi-root solve requires scipy.optimize.root.") from exc
+
+        warm = self.solve_gap_fixed_point(X, Delta0, opts)
+        chi0, _ = self.algebra.components(warm.X)
+        y0 = np.concatenate((np.real(chi0), np.imag(chi0)))
+        sol = root(
+            self.equilibrium_residual_vector,
+            y0,
+            method="hybr",
+            options={
+                "maxfev": opts.equilibrium_root_maxiter,
+                "xtol": opts.equilibrium_root_tol,
+            },
+        )
+        chi = sol.x[: self.algebra.nw] + 1.0j * sol.x[self.algebra.nw :]
+        f = self.algebra.fd(self.ws, self.algebra.params.T).astype(complex)
+        bundle = self.algebra.bundle_state(self.algebra.make_state(chi, f))
+        err = float(np.max(np.abs(self.equilibrium_residual_vector(sol.x))))
+        converged = bool(sol.success and err < opts.equilibrium_root_tol)
+        return self._gap_result(bundle, converged, int(sol.nfev), err, opts)
+
+    def solve_gap_fixed_point(
         self,
         X: Array,
         Delta0: float = 1.0,
@@ -994,12 +1177,21 @@ class EquilibriumModel:
             err = abs(next_delta - Delta)
             Delta = next_delta
             if err < opts.gap_tol:
-                return GapResult(
-                    Delta, bundle.gR, bundle.gK, bundle.X, ret_converged, it, max(err, ret_error),
-                )
-        return GapResult(
-            Delta, bundle.gR, bundle.gK, bundle.X, False, opts.gap_maxiter, max(err, ret_error),
-        )
+                return self._gap_result(bundle, ret_converged, it, max(err, ret_error), opts)
+        return self._gap_result(bundle, False, opts.gap_maxiter, max(err, ret_error), opts)
+
+    def solve_gap(
+        self,
+        X: Array,
+        Delta0: float = 1.0,
+        solver_params: solverParams | None = None,
+    ) -> GapResult:
+        opts = solver_params or self.solver_params
+        if opts.equilibrium_method == "chi_root":
+            return self.solve_gap_chi_root(X, Delta0, opts)
+        if opts.equilibrium_method == "fixed_point":
+            return self.solve_gap_fixed_point(X, Delta0, opts)
+        raise ValueError("equilibrium_method must be 'chi_root' or 'fixed_point'.")
 
     def equilibrium(
         self,
@@ -1008,6 +1200,11 @@ class EquilibriumModel:
     ) -> GapResult:
         X = self.algebra.equilibrium_occupation_state()
         return self.solve_gap(X, Delta0, solver_params)
+
+    def current(self, result: GapResult) -> float:
+        """Return equilibrium current J/sigma_n using the static A at t=0."""
+        A = self.algebra.vector_potential_value(0.0)
+        return self.algebra.current_from_state(result.X, A=A)
 
 
 ###################
@@ -1188,10 +1385,13 @@ class BackwardEulerDynamics:
         iterations = np.zeros(len(times), dtype=int)
         residuals = np.zeros(len(times), dtype=float)
         step_times = np.zeros(len(times), dtype=float)
+        currents = np.zeros(len(times), dtype=float) if opts.compute_current else None
 
         current = initial
         states[0] = current.X
         deltas[0] = current.Delta
+        if currents is not None:
+            currents[0] = self.current_from_bundle(current, float(times[0]))
         run_start = time.perf_counter()
         for i in range(1, len(times)):
             step_start = time.perf_counter()
@@ -1211,6 +1411,8 @@ class BackwardEulerDynamics:
             step_times[i] = time.perf_counter() - step_start
             states[i] = current.X
             deltas[i] = current.Delta
+            if currents is not None:
+                currents[i] = self.current_from_bundle(current, float(times[i]))
             elapsed = time.perf_counter() - run_start
             steps_done = i
             steps_total = len(times) - 1
@@ -1230,6 +1432,8 @@ class BackwardEulerDynamics:
                 "residual_converged": bool(residual_converged[i]),
                 "residual": float(residuals[i]),
             }
+            if currents is not None:
+                status["current"] = float(currents[i])
             if progress_callback is not None:
                 progress_callback(status)
             if show_progress and (i == 1 or i == steps_total or i % report_every == 0):
@@ -1254,6 +1458,8 @@ class BackwardEulerDynamics:
                 iterations = iterations[: i + 1]
                 residuals = residuals[: i + 1]
                 step_times = step_times[: i + 1]
+                if currents is not None:
+                    currents = currents[: i + 1]
                 times = times[: i + 1]
                 break
 
@@ -1267,7 +1473,18 @@ class BackwardEulerDynamics:
             iterations=iterations,
             residual=residuals,
             step_time=step_times,
+            current=currents,
         )
+
+    def current_from_bundle(self, bundle: StateBundle, t: float) -> float:
+        """Return dynamic current J/sigma_n for one bundled time slice."""
+        A = self.algebra.vector_potential_value(t)
+        return self.algebra.current_from_state(bundle.X, A=A)
+
+    def current(self, result: DynamicsResult) -> Array:
+        """Return dynamic current trace J/sigma_n for a DynamicsResult."""
+        A = self.algebra.vector_potential_value(result.times)
+        return self.algebra.current_from_state(result.X, A=A)
 
 
 ###################
